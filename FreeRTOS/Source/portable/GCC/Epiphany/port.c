@@ -4,24 +4,22 @@
 
 #define CyclesForTick (configCPU_CLOCK_HZ/configTICK_RATE_HZ - 50)
 
-unsigned int M[5] SECTION("shared_dram");
-
 /*-----------------------------------------------------------*/
-
-/* We require the address of the pxCurrentTCB variable, but don't want to know
-any details of its type. */
 typedef void TCB_t;
 extern volatile TCB_t * volatile pxCurrentTCB;
 
-
 extern void portRESTORE_CONTEXT();
+extern sighandler_t handlers[10];
 
+int interrupt_mode;
 /*-----------------------------------------------------------*/
 
 /*
  * Perform hardware setup to enable ticks from timer 1, compare match A.
  */
-void vSetupTimer( void );
+void vPortStartFirstTask( void );
+void vPortYield( void );
+static void prvSetupTimerInterrupt( void );
 /*-----------------------------------------------------------*/
 
 /* 
@@ -36,10 +34,12 @@ StackType_t *pxPortInitialiseStack( StackType_t *pxTopOfStack, TaskFunction_t px
     pxStackStart = (StackType_t *)(( StackType_t ) pxTopOfStack & ~(0x4));
     
     /* To ensure asserts in tasks.c don't fail, although in this case the assert
-    is not really required. */
+    is not really required.
+    https://freertos.org/FreeRTOS_Support_Forum_Archive/August_2011/freertos_ARM_Initialized_stack_alignment_assert_fail_4647606.html
+    */
     pxTopOfStack--;
 
-    /* for alignment */
+    /* for alignment ( we have 8 byte alignment but StackType_t = uint32_t ) */
     pxTopOfStack--;
 
     /* Setup the initial stack of the task.  The stack is set exactly as 
@@ -48,15 +48,14 @@ StackType_t *pxPortInitialiseStack( StackType_t *pxTopOfStack, TaskFunction_t px
     /* First on the stack is the return address - which in this case is the
     start of the task.  The offset is added to make the return address appear
     as it would within an IRQ ISR. */
-    *pxTopOfStack = ( StackType_t ) 0xdeadaffe;      
+    *pxTopOfStack = ( StackType_t ) 0xdeadaffe;
     pxTopOfStack--;
     pxTopOfStack--;
     pxTopOfStack--;
-
     
     int i;
     
-    for(i=63;i>14;i--) {
+    for(i = 63;i > 14; i--) {
       *pxTopOfStack = ( StackType_t ) i<<8; /* higher registers */
        pxTopOfStack--; 
     }
@@ -106,8 +105,6 @@ StackType_t *pxPortInitialiseStack( StackType_t *pxTopOfStack, TaskFunction_t px
     enabled, with interrupts disabled. */
     *pxTopOfStack = ( StackType_t ) 0x03;
 
-    
-
     /* Some optimisation levels use the stack differently to others.  This 
     means the interrupt flags cannot always be stored on the stack and will
     instead be stored in a variable, which is then saved as part of the
@@ -121,17 +118,23 @@ StackType_t *pxPortInitialiseStack( StackType_t *pxTopOfStack, TaskFunction_t px
 void setMemprotectMask(char mask) {
     unsigned memprotectregister = e_reg_read(E_REG_MEMPROTECT);
 
-    //clear last 8 bits
+    // clear last 8 bits
     memprotectregister &= 0xffffff00;
-    //sets it to the specified value
+    // sets it to the specified value
     memprotectregister |= mask;
 
     e_reg_write(E_REG_MEMPROTECT, memprotectregister);
 }
 
 
+/* Restore the context of the first task that is going to run.  From here
+on, the created tasks will be executing. */
+void vPortStartFirstTask( void )
+{
+    extern void portRESTORE_CONTEXT();
+    portRESTORE_CONTEXT();
+}
 
-extern sighandler_t handlers[10];
 /*
  * Sets up interrupts and starts first task
  */
@@ -149,15 +152,13 @@ BaseType_t xPortStartScheduler( void )
     e_irq_attach(E_SW_EXCEPTION, handlers[E_SW_EXCEPTION]);
     e_irq_mask(E_SW_EXCEPTION, E_FALSE);
 
-    e_irq_attach(E_MESSAGE_INT, handlers[E_MESSAGE_INT]);
-    e_irq_mask(E_MESSAGE_INT, E_FALSE);
-
     setMemprotectMask(0x0f);
 
-    vSetupTimer();
+	/* Start the timer that generates the tick ISR. */
+	prvSetupTimerInterrupt();
 
-	/* Restore the context of the first task that is going to run. */
-	portRESTORE_CONTEXT();
+	/* Start the first task. */
+	vPortStartFirstTask();	
 
 	/* Should not get here. */
 	return pdTRUE;
@@ -172,7 +173,7 @@ void vPortEndScheduler( void )
 /*-----------------------------------------------------------*/
 
 /*
- * Manual context switch. 
+ * Manual context switch called by portYIELD or taskYIELD
  * Cause a user interrupt on this core.
  */
 void vPortYield( void )
@@ -185,10 +186,10 @@ void vPortYield( void )
 }
 /*-----------------------------------------------------------*/
 
-/*
- * Setus up the timer as necessary.
+/* 
+ * Sets up the periodic ISR used for the RTOS tick. 
  */
-void vSetupTimer( void )
+static void prvSetupTimerInterrupt( void )
 {
     unsigned int cyclesForTick = CyclesForTick;
     int delta = E_CTIMER_MAX - e_ctimer_get(E_CTIMER_1) - cyclesForTick;  //How much off are we this time?
@@ -203,45 +204,16 @@ void vSetupTimer( void )
 }
 
 
-struct layout
-{
-    volatile int status;
-    volatile int pc;
-    volatile int no[64]; //collection of all the registers as stored onto the stack
-};
-
-
-
-void injectErrors( void )
-{
-    TaskHandle_t runningTask = xTaskGetCurrentTaskHandle();
-    TCB_t **tcb = runningTask;
-    struct layout* reg = *tcb;
-
-    int bitmask = 1 << (rand()%32);
-    int failreg = rand()%64;
-    reg->no[failreg] ^= bitmask;
-    M[4]++;
-}
-
-extern void irqMsg();
-int interrupt_mode;
 void vInterruptCentral( void ) {
     switch (interrupt_mode) {
         case E_TIMER0_INT:
-            vSetupTimer();
+            prvSetupTimerInterrupt();
             if( xTaskIncrementTick() != pdFALSE ) {
                 vTaskSwitchContext();
             }
             break;
-        case E_SW_EXCEPTION: //triggered extrenally for error injection. Must be that high prority
-            injectErrors();
-            break;
         case E_USER_INT:
             vTaskSwitchContext();
-            break;
-        case E_MESSAGE_INT: //message, triggered externally for message transmission
-            irqMsg();
             break;
         case E_MEM_FAULT: // written to read-only memory
             while(1);

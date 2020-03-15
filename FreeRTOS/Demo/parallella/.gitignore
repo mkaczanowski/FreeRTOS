@@ -1,5 +1,0 @@
-*.o
-*.srec
-*.elf
-armcode
-.gdbinit
